@@ -3,6 +3,7 @@ import json
 import pytest
 
 from hermes_cli import models
+from hermes_cli import models_local
 
 
 MODEL = "publisher/model"
@@ -52,14 +53,31 @@ def _capture_load(monkeypatch, response_payload):
 
 
 
+def test_jit_load_without_explicit_context_reads_runtime_from_loaded_instance(monkeypatch):
+    """JIT load (no explicit context, no echoed load_config) must discover the runtime
+    context LM Studio applied from its configured default via the refreshed models list,
+    not fall back to the 64K probe tier. Regression for the JIT arm of the refresh-after-load."""
+    catalogs = iter([
+        _catalog(),  # Before load: no loaded instance
+        _catalog(loaded_context=132_096),  # After load with LM Studio's configured default
+    ])
+    monkeypatch.setattr(models_local, "_lmstudio_fetch_raw_models", lambda **_kwargs: next(catalogs))
+    _capture_load(monkeypatch, {"status": "loaded"})
+
+    result = models_local.ensure_lmstudio_model_loaded(
+        MODEL, BASE_URL, api_key="", target_context_length=None
+    )
+
+    assert result == 132_096
+
+
 def test_missing_echo_refreshes_loaded_state(monkeypatch):
     catalogs = iter([_catalog(), _catalog(loaded_context=88_000)])
-    monkeypatch.setattr(
-        models, "_lmstudio_fetch_raw_models", lambda **_kwargs: next(catalogs)
+    monkeypatch.setattr(models_local, "_lmstudio_fetch_raw_models", lambda **_kwargs: next(catalogs)
     )
     _capture_load(monkeypatch, {"status": "loaded"})
 
-    result = models.ensure_lmstudio_model_loaded(
+    result = models_local.ensure_lmstudio_model_loaded(
         MODEL, BASE_URL, api_key="", target_context_length=100_000
     )
 
@@ -67,9 +85,7 @@ def test_missing_echo_refreshes_loaded_state(monkeypatch):
 
 
 def test_explicit_override_above_known_maximum_rejects_even_when_loaded(monkeypatch):
-    monkeypatch.setattr(
-        models,
-        "_lmstudio_fetch_raw_models",
+    monkeypatch.setattr(models_local, "_lmstudio_fetch_raw_models",
         lambda **_kwargs: _catalog(loaded_context=64_000, maximum=128_000),
     )
     monkeypatch.setattr(
@@ -78,7 +94,7 @@ def test_explicit_override_above_known_maximum_rejects_even_when_loaded(monkeypa
         lambda *_args, **_kwargs: pytest.fail("invalid override must not be posted"),
     )
 
-    result = models.ensure_lmstudio_model_loaded(
+    result = models_local.ensure_lmstudio_model_loaded(
         MODEL,
         BASE_URL,
         api_key="",
