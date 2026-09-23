@@ -164,8 +164,8 @@ def test_ttl_without_target_disables_scheduling(monkeypatch, fired):
     monkeypatch.setattr(aux, "_detect_endpoint_unload", lambda base, key="": None)
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is None  # unknown endpoint: never probed/armed
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx is None  # unknown endpoint: never probed/armed
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager._timers == {}
 
@@ -176,8 +176,8 @@ def test_ttl_zero_disables_everything(monkeypatch, fired):
     _patch_route(monkeypatch)
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is None
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx is None
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager._timers == {}
 
@@ -258,15 +258,24 @@ def test_run_unload_cmd_fills_template(tmp_path, monkeypatch):
 
 # ---- scheduling guards ----------------------------------------------------
 
+class FakeComp:
+    """Stands in for ContextCompressor: the probe hook reads these fields."""
+    base_url = "http://localhost:9999/v1"
+    model = "main-model"
+    provider = "custom"
+    api_key = ""
+    api_mode = ""
+    _aux_compression_ctx = None
+    _aux_compression_unload_key = None
+
+
 class FakeAgent:
     base_url = "http://localhost:9999/v1"
-    _aux_compression_was_offline = None
-    _aux_compression_unload_key = None
     model = "main-model"
     session_id = "test"
 
-    def _current_main_runtime(self):
-        return {"provider": "custom", "model": "main-model", "base_url": self.base_url}
+    def __init__(self):
+        self.context_compressor = FakeComp()
 
 
 def _patch_route(monkeypatch, base_url="http://localhost:8642/v1", model="intermediate"):
@@ -278,8 +287,8 @@ def test_nothing_scheduled_when_feature_off(monkeypatch, fired):
     monkeypatch.setattr(aux, "_load_config", lambda: {})
     _patch_route(monkeypatch)
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is None
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx is None
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager._timers == {}
 
@@ -291,13 +300,13 @@ def test_schedules_only_after_a_cold_load(monkeypatch, fired):
     state = {"loaded": False}
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (state["loaded"], None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is True  # was not loaded before the summary
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx[3] is True  # was not loaded before the call
     state["loaded"] = True
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager.is_armed(*KEY)
     # the summary finished; timer fires after the idle delay
-    aux.clear_aux_compression_in_flight(agent)
+    aux.clear_aux_compression_in_flight(agent.context_compressor)
     deadline = time.monotonic() + 2
     while aux._manager.is_armed(*KEY) and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -311,8 +320,8 @@ def test_skipped_summary_never_arms(monkeypatch, fired):
     _patch_route(monkeypatch)
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is True
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx[3] is True
     aux.schedule_aux_unload_after_compression(agent)  # still offline at schedule time
     assert aux._manager._timers == {}
 
@@ -324,8 +333,8 @@ def test_unknown_probe_never_arms(monkeypatch, fired):
     _patch_route(monkeypatch)
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (None, None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
-    assert agent._aux_compression_was_offline is False
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
+    assert agent.context_compressor._aux_compression_ctx[3] is False  # unknown probe: not a known cold-load
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager._timers == {}
 
@@ -335,7 +344,7 @@ def test_warm_model_never_arms_and_main_route_guarded(monkeypatch, fired):
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (True, None))
     _patch_route(monkeypatch)
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager._timers == {}  # was already loaded -> not ours to evict
 
@@ -343,10 +352,10 @@ def test_warm_model_never_arms_and_main_route_guarded(monkeypatch, fired):
     _patch_route(monkeypatch, base_url=FakeAgent.base_url, model="main-model")
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
     agent2 = FakeAgent()
-    aux.note_aux_state_before_summary(agent2)
+    aux.note_aux_state_before_summary_call(agent2.context_compressor)
     aux.schedule_aux_unload_after_compression(agent2)
     assert aux._manager._timers == {}
-    assert getattr(agent2, "_aux_compression_was_offline") in (None, False)
+    assert getattr(agent2.context_compressor, "_aux_compression_ctx", None) in (None, False) or agent2.context_compressor._aux_compression_ctx[3] is False
 
 
 def test_warm_compression_extends_existing_timer(monkeypatch, fired):
@@ -356,15 +365,59 @@ def test_warm_compression_extends_existing_timer(monkeypatch, fired):
     state = {"loaded": False}
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (state["loaded"], None))
     agent = FakeAgent()
-    aux.note_aux_state_before_summary(agent)
+    aux.note_aux_state_before_summary_call(agent.context_compressor)
     state["loaded"] = True  # the cold summary loaded it
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager.is_armed(*KEY)
-    aux.clear_aux_compression_in_flight(agent)
+    aux.clear_aux_compression_in_flight(agent.context_compressor)
     # second compression: model already warm (probe True), timer still re-armed
     monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (True, None))
     agent2 = FakeAgent()
-    aux.note_aux_state_before_summary(agent2)
+    aux.note_aux_state_before_summary_call(agent2.context_compressor)
     aux.schedule_aux_unload_after_compression(agent2)
     assert aux._manager.is_armed(*KEY)
-    aux.clear_aux_compression_in_flight(agent2)
+    aux.clear_aux_compression_in_flight(agent2.context_compressor)
+
+
+# ---- probe placement (the optimization): probe at the call site, not before compress() ----
+
+def _real_compressor():
+    from unittest.mock import patch
+    from agent.context_compressor import ContextCompressor
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        return ContextCompressor(model="main-model", summary_model_override="intermediate", quiet_mode=True)
+
+
+def test_skipped_summarisation_pays_no_probe(monkeypatch, fired):
+    """A compression that never reaches the summary LLM must not probe loaded-state at all."""
+    monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=60))
+    probes = []
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": probes.append(1) or (False, None))
+    comp = _real_compressor()
+    # structural no-op: nothing eligible to compress (tiny transcript, forced)
+    comp.compress([{"role": "user", "content": "hi"}], current_tokens=10, force=True)
+    assert probes == []
+    assert comp._aux_compression_ctx is None
+
+
+def test_summary_call_probes_once_across_retry(monkeypatch, fired):
+    """The probe fires at the single aux-call seam; a main-model retry reuses the verdict."""
+    from unittest.mock import MagicMock, patch
+    monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=60))
+    _patch_route(monkeypatch)
+    probes = []
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": probes.append(1) or (False, None))
+    comp = _real_compressor()
+
+    def _truncated(*a, **k):
+        resp = MagicMock()
+        choice = MagicMock()
+        choice.message.content = "partial"
+        choice.finish_reason = "length"
+        resp.choices = [choice]
+        return resp
+
+    with patch("agent.context_compressor.call_llm", side_effect=_truncated):
+        comp._generate_summary([{"role": "user", "content": "x " * 50}])
+    assert comp._aux_compression_ctx == ("http://localhost:8642/v1", "intermediate", "", True)
+    assert len(probes) == 1  # the retry on the main model must not re-probe

@@ -411,42 +411,48 @@ def _load_config() -> Dict[str, Any]:
     return load_config_readonly() or {}
 
 
-def note_aux_state_before_summary(agent: Any) -> None:
-    """Record whether the aux compression model was already loaded, before a summary runs.
+def note_aux_state_before_summary_call(comp: Any) -> None:
+    """Probe the aux model's loaded state right before the summary LLM call.
 
-    Stores agent._aux_compression_was_offline = True/False/None (None = unknown/disabled)
-    and marks the (endpoint, model) key in-flight so an armed timer cannot evict the
-    model mid-summary.
+    Runs at the single point where the compression model is actually used
+    (ContextCompressor._call_summary_llm), so a compression that never summarises —
+    feasibility skip, structural no-op, failure cooldown, deterministic pin, a fence
+    cancelled before dispatch — pays no probe at all. Stores
+    comp._aux_compression_ctx = (base_url, model, api_key, was_offline) and marks the
+    (endpoint, model) key in-flight so an armed timer cannot evict the model
+    mid-summary. A retry within the same compression (main-model fallback) reuses the
+    first probe's verdict instead of paying for a second one.
     """
-    agent._aux_compression_was_offline = None
-    agent._aux_compression_unload_key = None
     try:
+        if getattr(comp, "_aux_compression_ctx", None) is not None:
+            return  # retry of the same compression: verdict + in-flight mark already exist
         cfg = _load_config()
         cfg_cmd, delay = _unload_config(cfg)
         if delay <= 0:
             return
-        aux_base_url, aux_model, aux_key = _resolve_aux_route(agent)
+        aux_base_url, aux_model, aux_key = _resolve_aux_route(comp)
         if not aux_base_url or not aux_model or not is_local_endpoint(str(aux_base_url)):
             return
         if not resolve_unload_target(cfg_cmd, str(aux_base_url), aux_key, cfg):
             return
         # Never arm against the model/route serving this very conversation.
-        if _same_route(aux_base_url, aux_model, getattr(agent, "base_url", None), getattr(agent, "model", None)):
+        if _same_route(aux_base_url, aux_model, getattr(comp, "base_url", None), getattr(comp, "model", None)):
             return
+        was_offline = probe_aux_loaded(str(aux_base_url), str(aux_model), aux_key) is False
         key = (str(aux_base_url), str(aux_model))
         with _in_flight_lock:
             _in_flight[key] = _in_flight.get(key, 0) + 1
-        agent._aux_compression_unload_key = key
-        agent._aux_compression_was_offline = probe_aux_loaded(str(aux_base_url), aux_model, aux_key) is False
+        comp._aux_compression_unload_key = key
+        comp._aux_compression_ctx = (str(aux_base_url), str(aux_model), aux_key, was_offline)
     except Exception as exc:  # noqa: BLE001
         logger.debug("aux compression pre-summary probe skipped: %s", exc)
 
 
-def clear_aux_compression_in_flight(agent: Any) -> None:
-    """Drop the in-flight mark set by note_aux_state_before_summary (finally-safe)."""
-    key = getattr(agent, "_aux_compression_unload_key", None)
+def clear_aux_compression_in_flight(comp: Any) -> None:
+    """Drop the in-flight mark set by note_aux_state_before_summary_call (finally-safe)."""
+    key = getattr(comp, "_aux_compression_unload_key", None) if comp is not None else None
     if key is not None:
-        agent._aux_compression_unload_key = None
+        comp._aux_compression_unload_key = None
         with _in_flight_lock:
             remaining = _in_flight.get(key, 0) - 1
             if remaining > 0:
@@ -458,44 +464,58 @@ def clear_aux_compression_in_flight(agent: Any) -> None:
 def schedule_aux_unload_after_compression(agent: Any) -> None:
     """After a committed compression: if the model had to load for it, arm the idle unload.
 
-    A new compression re-arms (resets) the timer instead of stacking one per run; a warm
-    compression only extends an already-armed timer (the idle window counts from the
-    LAST compression, not from the one that cold-loaded the model).
+    The verdict comes from the probe the summary call itself recorded
+    (comp._aux_compression_ctx): a compression that never reached the summary LLM —
+    feasibility skip, structural no-op, cooldown, deterministic pin — recorded nothing
+    and arms nothing. A new compression re-arms (resets) the timer instead of stacking
+    one per run; a warm compression only extends an already-armed timer (the idle
+    window counts from the LAST compression, not from the one that cold-loaded).
     """
-    clear_aux_compression_in_flight(agent)
+    comp = getattr(agent, "context_compressor", None)
+    clear_aux_compression_in_flight(comp)
     try:
+        ctx = getattr(comp, "_aux_compression_ctx", None) if comp is not None else None
+        if ctx is None:
+            return
+        aux_base_url, aux_model, aux_key, was_offline = ctx
         cfg = _load_config()
         cfg_cmd, delay = _unload_config(cfg)
         if delay <= 0:
             return
-        aux_base_url, aux_model, aux_key = _resolve_aux_route(agent)
-        if not aux_base_url or not aux_model:
-            return
-        target = resolve_unload_target(cfg_cmd, str(aux_base_url), aux_key, cfg)
+        target = resolve_unload_target(cfg_cmd, aux_base_url, aux_key, cfg)
         if not target:
             return
         if _same_route(aux_base_url, aux_model, getattr(agent, "base_url", None), getattr(agent, "model", None)):
             return
-        was_offline = getattr(agent, "_aux_compression_was_offline", None) is True
-        if not was_offline and not _manager.is_armed(str(aux_base_url), aux_model):
+        if not was_offline and not _manager.is_armed(aux_base_url, aux_model):
             return
-        if was_offline and probe_aux_loaded(str(aux_base_url), aux_model, aux_key) is False:
-            # The summary never loaded the model (e.g. the attempt skipped summarising for
-            # low context, or a fallback lane answered): there is no idle load to evict,
-            # and arming could later evict a load someone else made for another purpose.
+        if was_offline and probe_aux_loaded(aux_base_url, aux_model, aux_key) is False:
+            # The summary never loaded the model (e.g. a fallback lane answered after the
+            # aux call failed before loading): there is no idle load of ours to evict, and
+            # arming could later evict a load someone else made for another purpose.
             return
-        _manager.reset(str(aux_base_url), aux_model, delay, target, aux_key)
+        _manager.reset(aux_base_url, aux_model, delay, target, aux_key)
         logger.info("aux compression model '%s' will unload in %.0fs if it stays idle", aux_model, delay)
     except Exception as exc:  # noqa: BLE001
         logger.debug("aux compression unload scheduling skipped: %s", exc)
 
 
-def _resolve_aux_route(agent: Any) -> Tuple[Optional[str], Optional[str], str]:
+def _main_runtime(comp: Any) -> Dict[str, Any]:
+    """Main-runtime dict for aux route resolution, from the compressor's own fields
+    (the same ones _call_summary_llm forwards to call_llm)."""
+    return {
+        "model": getattr(comp, "model", None), "provider": getattr(comp, "provider", None),
+        "base_url": getattr(comp, "base_url", None), "api_key": getattr(comp, "api_key", None),
+        "api_mode": getattr(comp, "api_mode", None),
+    }
+
+
+def _resolve_aux_route(comp: Any) -> Tuple[Optional[str], Optional[str], str]:
     """(base_url, model, api_key) of the aux compression lane, or (None, None, '')."""
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
 
-        client, aux_model = get_text_auxiliary_client("compression", main_runtime=agent._current_main_runtime())
+        client, aux_model = get_text_auxiliary_client("compression", main_runtime=_main_runtime(comp))
         if client is None or not aux_model:
             return None, None, ""
         raw_key = getattr(client, "api_key", "")

@@ -4007,8 +4007,7 @@ def compress_context(
     # finishes or closes in its daemon worker. Otherwise four timed-out streams retain all four shared
     # compression-pool slots until the auxiliary stream's longer absolute ceiling expires. See #23975.
     _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
-    from agent.aux_compression_unload import note_aux_state_before_summary, schedule_aux_unload_after_compression
-    note_aux_state_before_summary(agent)
+    from agent.aux_compression_unload import schedule_aux_unload_after_compression
     try:
         phase = _run_summary_phase(
             agent, messages, lease=lease, in_place=in_place, checkpoint_required=checkpoint_required,
@@ -4019,7 +4018,7 @@ def compress_context(
         # The summary is the only phase that uses the aux model; drop the in-flight mark
         # (the success path's schedule clears it first; aborts/exceptions land here).
         from agent.aux_compression_unload import clear_aux_compression_in_flight
-        clear_aux_compression_in_flight(agent)
+        clear_aux_compression_in_flight(getattr(agent, "context_compressor", None))
     if phase.abort_prompt is not None:
         return phase.messages, phase.abort_prompt
     messages, compressed = phase.messages, phase.compressed
