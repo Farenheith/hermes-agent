@@ -287,10 +287,13 @@ def test_nothing_scheduled_when_feature_off(monkeypatch, fired):
 def test_schedules_only_after_a_cold_load(monkeypatch, fired):
     monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=0.05))
     _patch_route(monkeypatch)
-    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
+    # offline before the summary, loaded at schedule time (the summary cold-loaded it)
+    state = {"loaded": False}
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (state["loaded"], None))
     agent = FakeAgent()
     aux.note_aux_state_before_summary(agent)
     assert agent._aux_compression_was_offline is True  # was not loaded before the summary
+    state["loaded"] = True
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager.is_armed(*KEY)
     # the summary finished; timer fires after the idle delay
@@ -299,6 +302,32 @@ def test_schedules_only_after_a_cold_load(monkeypatch, fired):
     while aux._manager.is_armed(*KEY) and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not aux._manager.is_armed(*KEY)
+
+
+def test_skipped_summary_never_arms(monkeypatch, fired):
+    """A compression that never loaded the aux model (low-context skip / fallback lane)
+    must not arm the idle unload — there is no idle load of ours to evict."""
+    monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=0.05))
+    _patch_route(monkeypatch)
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
+    agent = FakeAgent()
+    aux.note_aux_state_before_summary(agent)
+    assert agent._aux_compression_was_offline is True
+    aux.schedule_aux_unload_after_compression(agent)  # still offline at schedule time
+    assert aux._manager._timers == {}
+
+
+def test_unknown_probe_never_arms(monkeypatch, fired):
+    """Probe can't decide at note time: conservative — never arm (only a known
+    cold-load arms; the timer's own pre-fire probe is the second backstop)."""
+    monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=60))
+    _patch_route(monkeypatch)
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (None, None))
+    agent = FakeAgent()
+    aux.note_aux_state_before_summary(agent)
+    assert agent._aux_compression_was_offline is False
+    aux.schedule_aux_unload_after_compression(agent)
+    assert aux._manager._timers == {}
 
 
 def test_warm_model_never_arms_and_main_route_guarded(monkeypatch, fired):
@@ -324,9 +353,11 @@ def test_warm_compression_extends_existing_timer(monkeypatch, fired):
     """Idle window counts from the LAST compression, not from the cold-load one."""
     monkeypatch.setattr(aux, "_load_config", lambda: _cfg(cmd="curl x {model}", delay=60))
     _patch_route(monkeypatch)
-    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (False, None))
+    state = {"loaded": False}
+    monkeypatch.setattr(aux, "probe_aux_state", lambda base, model, key="": (state["loaded"], None))
     agent = FakeAgent()
     aux.note_aux_state_before_summary(agent)
+    state["loaded"] = True  # the cold summary loaded it
     aux.schedule_aux_unload_after_compression(agent)
     assert aux._manager.is_armed(*KEY)
     aux.clear_aux_compression_in_flight(agent)

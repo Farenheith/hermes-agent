@@ -479,6 +479,11 @@ def schedule_aux_unload_after_compression(agent: Any) -> None:
         was_offline = getattr(agent, "_aux_compression_was_offline", None) is True
         if not was_offline and not _manager.is_armed(str(aux_base_url), aux_model):
             return
+        if was_offline and probe_aux_loaded(str(aux_base_url), aux_model, aux_key) is False:
+            # The summary never loaded the model (e.g. the attempt skipped summarising for
+            # low context, or a fallback lane answered): there is no idle load to evict,
+            # and arming could later evict a load someone else made for another purpose.
+            return
         _manager.reset(str(aux_base_url), aux_model, delay, target, aux_key)
         logger.info("aux compression model '%s' will unload in %.0fs if it stays idle", aux_model, delay)
     except Exception as exc:  # noqa: BLE001
